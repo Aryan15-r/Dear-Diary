@@ -1,0 +1,21 @@
+{
+  "name": "dear-diary-backend",
+  "version": "1.0.0",
+  "description": "Production-Grade Private Journal with Discreet Shared Access Backend API",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.8.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "google-auth-library": "^11.0.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
