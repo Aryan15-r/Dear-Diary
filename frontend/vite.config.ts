@@ -20,7 +20,7 @@ export default defineConfig({
     }
   },
   build: {
-    outDir: process.env.VERCEL ? 'dist' : '../public',
+    outDir: process.env.VERCEL ? '../dist' : '../public',
     emptyOutDir: true
   }
 });
