@@ -1,25 +1,62 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "backend/server.js",
-      "use": "@vercel/node"
+    "services": {
+        "frontend": {
+            "root": "frontend",
+            "framework": "vite"
+        },
+        "backend": {
+            "root": "backend"
+        }
     },
-    {
-      "src": "frontend/package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "dist"
-      }
-    }
-  ],
-  "rewrites": [
-    { "source": "/auth/:match*", "destination": "/backend/server.js" },
-    { "source": "/entries/:match*", "destination": "/backend/server.js" },
-    { "source": "/audio/:match*", "destination": "/backend/server.js" },
-    { "source": "/transcripts/:match*", "destination": "/backend/server.js" },
-    { "source": "/access/:match*", "destination": "/backend/server.js" },
-    { "source": "/api/:match*", "destination": "/backend/server.js" },
-    { "source": "/(.*)", "destination": "/frontend/$1" }
-  ]
+    "rewrites": [
+        {
+            "source": "/auth(/.*)?",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/entries(/.*)?",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/audio(/.*)?",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/transcripts(/.*)?",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/access(/.*)?",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/api(/.*)?",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/(.*)",
+            "destination": {
+                "type": "service",
+                "service": "frontend"
+            }
+        }
+    ]
 }
