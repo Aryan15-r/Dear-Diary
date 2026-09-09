@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "backend/server.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "frontend/package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "dist"
+      }
+    }
+  ],
+  "rewrites": [
+    { "source": "/auth/:match*", "destination": "/backend/server.js" },
+    { "source": "/entries/:match*", "destination": "/backend/server.js" },
+    { "source": "/audio/:match*", "destination": "/backend/server.js" },
+    { "source": "/transcripts/:match*", "destination": "/backend/server.js" },
+    { "source": "/access/:match*", "destination": "/backend/server.js" },
+    { "source": "/api/:match*", "destination": "/backend/server.js" },
+    { "source": "/(.*)", "destination": "/frontend/$1" }
+  ]
+}

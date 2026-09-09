@@ -1,56 +1,73 @@
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+const { createClient } = require('@supabase/supabase-js');
 const { db, generateUUID } = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { authorizeResource } = require('../middleware/authorize');
 
 const router = express.Router();
 
-// Audio Upload Directory Setup
-const uploadDir = path.join(__dirname, '..', 'uploads', 'audio');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-        const uniqueKey = `${generateUUID()}${path.extname(file.originalname) || '.webm'}`;
-        cb(null, uniqueKey);
-    }
-});
-
+// We use multer with memory storage because serverless functions can't write to disk
+const storage = multer.memoryStorage();
 const upload = multer({
     storage,
     limits: { fileSize: 25 * 1024 * 1024 } // 25MB max
 });
 
 // POST /entries/:id/audio — Upload audio to journal entry (Owner only)
-router.post('/entries/:id/audio', authenticate, authorizeResource('edit', 'entry'), upload.single('audio'), (req, res) => {
+router.post('/entries/:id/audio', authenticate, authorizeResource('edit', 'entry'), upload.single('audio'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ error: 'Audio file payload is missing.' });
+        }
+        
+        if (!supabase) {
+            return res.status(503).json({ error: 'Supabase Storage is not configured. Please add SUPABASE_URL and SUPABASE_ANON_KEY to your .env file.' });
         }
 
         const entryId = req.params.id;
         const audioId = generateUUID();
         const durationSeconds = parseInt(req.body.duration) || 0;
+        
+        // Ensure extension is webm
+        const filename = `${audioId}.webm`;
 
-        db.prepare(`
-            INSERT INTO audio_entries (id, journal_entry_id, storage_key, duration_seconds, mime_type)
-            VALUES (?, ?, ?, ?, ?)
-        `).run(audioId, entryId, req.file.filename, durationSeconds, req.file.mimetype || 'audio/webm');
+        // Upload to Supabase Storage (bucket name: "audio")
+        const { data, error } = await supabase.storage
+            .from('audio')
+            .upload(filename, req.file.buffer, {
+                contentType: req.file.mimetype || 'audio/webm',
+                upsert: false
+            });
+            
+        if (error) {
+            console.error('Supabase upload error:', error);
+            return res.status(500).json({ error: 'Failed to upload audio to cloud storage.' });
+        }
+
+        await db.execute({
+            sql: `
+                INSERT INTO audio_entries (id, journal_entry_id, storage_key, duration_seconds, mime_type)
+                VALUES (?, ?, ?, ?, ?)
+            `,
+            args: [audioId, entryId, filename, durationSeconds, req.file.mimetype || 'audio/webm']
+        });
 
         // Automatically trigger mock speech-to-text transcript creation
         const transcriptId = generateUUID();
         const mockTranscriptText = req.body.transcriptText || "Voice entry recorded. Transcription generated successfully.";
 
-        db.prepare(`
-            INSERT INTO transcripts (id, audio_entry_id, text, provider, status)
-            VALUES (?, ?, ?, 'dear_diary_stt', 'completed')
-        `).run(transcriptId, audioId, mockTranscriptText);
+        await db.execute({
+            sql: `
+                INSERT INTO transcripts (id, audio_entry_id, text, provider, status)
+                VALUES (?, ?, ?, 'dear_diary_stt', 'completed')
+            `,
+            args: [transcriptId, audioId, mockTranscriptText]
+        });
 
         return res.status(201).json({
             message: 'Audio recording saved and transcribed successfully.',
@@ -71,26 +88,37 @@ router.post('/entries/:id/audio', authenticate, authorizeResource('edit', 'entry
 });
 
 // GET /audio/:id — Authenticated Audio Streaming / Download (Owner or Authorized Recipient)
-router.get('/audio/:id', authenticate, authorizeResource('read', 'audio'), (req, res) => {
+router.get('/audio/:id', authenticate, authorizeResource('read', 'audio'), async (req, res) => {
     try {
         const audioId = req.params.id;
-        const audio = db.prepare(`SELECT * FROM audio_entries WHERE id = ? AND deleted_at IS NULL`).get(audioId);
+        
+        if (!supabase) {
+            return res.status(503).json({ error: 'Supabase Storage is not configured.' });
+        }
+        
+        const audioResult = await db.execute({
+            sql: `SELECT * FROM audio_entries WHERE id = ? AND deleted_at IS NULL`,
+            args: [audioId]
+        });
 
-        if (!audio) {
+        if (audioResult.rows.length === 0) {
             return res.status(404).json({ error: 'Audio file unavailable.' });
         }
-
-        const filePath = path.join(uploadDir, audio.storage_key);
-
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ error: 'Audio storage file not found.' });
+        
+        const audio = audioResult.rows[0];
+        
+        // Generate a signed URL from Supabase valid for 1 hour (3600 seconds)
+        const { data, error } = await supabase.storage
+            .from('audio')
+            .createSignedUrl(audio.storage_key, 3600);
+            
+        if (error || !data) {
+            console.error("Failed to generate signed URL:", error);
+            return res.status(500).json({ error: 'Failed to stream audio from cloud storage.' });
         }
 
-        res.setHeader('Content-Type', audio.mime_type || 'audio/webm');
-        res.setHeader('Content-Disposition', `inline; filename="audio_${audio.id}.webm"`);
-        
-        const readStream = fs.createReadStream(filePath);
-        readStream.pipe(res);
+        // Redirect the client directly to the secure signed URL
+        return res.redirect(data.signedUrl);
     } catch (err) {
         console.error('Audio streaming error:', err);
         return res.status(500).json({ error: 'Failed to stream audio.' });
@@ -98,10 +126,16 @@ router.get('/audio/:id', authenticate, authorizeResource('read', 'audio'), (req,
 });
 
 // DELETE /audio/:id — Delete audio recording (Owner only)
-router.delete('/audio/:id', authenticate, authorizeResource('delete', 'audio'), (req, res) => {
+router.delete('/audio/:id', authenticate, authorizeResource('delete', 'audio'), async (req, res) => {
     try {
         const audioId = req.params.id;
-        db.prepare(`UPDATE audio_entries SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`).run(audioId);
+        
+        // Soft delete from DB
+        await db.execute({
+            sql: `UPDATE audio_entries SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            args: [audioId]
+        });
+        
         return res.json({ message: 'Audio entry deleted.' });
     } catch (err) {
         return res.status(500).json({ error: 'Failed to delete audio.' });

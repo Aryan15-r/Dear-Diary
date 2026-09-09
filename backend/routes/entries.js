@@ -6,7 +6,7 @@ const { authorizeResource } = require('../middleware/authorize');
 const router = express.Router();
 
 // GET /entries — Paginated list of owned and connected entries
-router.get('/', authenticate, (req, res) => {
+router.get('/', authenticate, async (req, res) => {
     try {
         const userId = req.user.id;
         const page = parseInt(req.query.page) || 1;
@@ -34,9 +34,12 @@ router.get('/', authenticate, (req, res) => {
         query += ` ORDER BY e.entry_date DESC, e.created_at DESC LIMIT ? OFFSET ?`;
         params.push(limit, offset);
 
-        let entries = db.prepare(query).all(...params);
+        const entriesResult = await db.execute({
+            sql: query,
+            args: params
+        });
 
-        entries = entries.map(e => ({
+        const entries = entriesResult.rows.map(e => ({
             ...e,
             tags: e.tags ? e.tags.split(',').map(t => t.trim()).filter(Boolean) : []
         }));
@@ -53,7 +56,7 @@ router.get('/', authenticate, (req, res) => {
 });
 
 // POST /entries — Create new entry
-router.post('/', authenticate, (req, res) => {
+router.post('/', authenticate, async (req, res) => {
     try {
         const { title, body, mood, tags, entryDate } = req.body;
         const ownerId = req.user.id;
@@ -66,12 +69,19 @@ router.post('/', authenticate, (req, res) => {
         const date = entryDate || new Date().toISOString().split('T')[0];
         const tagString = Array.isArray(tags) ? tags.join(',') : (tags || '');
 
-        db.prepare(`
-            INSERT INTO journal_entries (id, owner_user_id, title, body, mood, tags, entry_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(entryId, ownerId, title || 'Untitled Entry', body || '', mood || null, tagString, date);
+        await db.execute({
+            sql: `
+                INSERT INTO journal_entries (id, owner_user_id, title, body, mood, tags, entry_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `,
+            args: [entryId, ownerId, title || 'Untitled Entry', body || '', mood || null, tagString, date]
+        });
 
-        const newEntry = db.prepare(`SELECT * FROM journal_entries WHERE id = ?`).get(entryId);
+        const newEntryResult = await db.execute({
+            sql: `SELECT * FROM journal_entries WHERE id = ?`,
+            args: [entryId]
+        });
+        const newEntry = newEntryResult.rows[0];
 
         return res.status(201).json({
             message: 'Entry saved.',
@@ -87,23 +97,31 @@ router.post('/', authenticate, (req, res) => {
 });
 
 // GET /entries/:id — Single entry details
-router.get('/:id', authenticate, authorizeResource('read', 'entry'), (req, res) => {
+router.get('/:id', authenticate, authorizeResource('read', 'entry'), async (req, res) => {
     try {
         const entry = req.entry;
 
-        const audio = db.prepare(`
-            SELECT a.id, a.duration_seconds, a.mime_type, a.created_at,
-                   t.id as transcript_id, t.text as transcript_text, t.status as transcript_status
-            FROM audio_entries a
-            LEFT JOIN transcripts t ON t.audio_entry_id = a.id
-            WHERE a.journal_entry_id = ? AND a.deleted_at IS NULL
-        `).all(entry.id);
+        const audioResult = await db.execute({
+            sql: `
+                SELECT a.id, a.duration_seconds, a.mime_type, a.created_at,
+                       t.id as transcript_id, t.text as transcript_text, t.status as transcript_status
+                FROM audio_entries a
+                LEFT JOIN transcripts t ON t.audio_entry_id = a.id
+                WHERE a.journal_entry_id = ? AND a.deleted_at IS NULL
+            `,
+            args: [entry.id]
+        });
+        const audio = audioResult.rows;
 
-        const attachments = db.prepare(`
-            SELECT id, original_name, mime_type, size_bytes, created_at
-            FROM attachments
-            WHERE journal_entry_id = ? AND deleted_at IS NULL
-        `).all(entry.id);
+        const attachmentsResult = await db.execute({
+            sql: `
+                SELECT id, original_name, mime_type, size_bytes, created_at
+                FROM attachments
+                WHERE journal_entry_id = ? AND deleted_at IS NULL
+            `,
+            args: [entry.id]
+        });
+        const attachments = attachmentsResult.rows;
 
         return res.json({
             entry: {
@@ -120,7 +138,7 @@ router.get('/:id', authenticate, authorizeResource('read', 'entry'), (req, res) 
 });
 
 // PATCH /entries/:id — Update entry
-router.patch('/:id', authenticate, authorizeResource('edit', 'entry'), (req, res) => {
+router.patch('/:id', authenticate, authorizeResource('edit', 'entry'), async (req, res) => {
     try {
         const { title, body, mood, tags, entryDate } = req.body;
         const entryId = req.params.id;
@@ -132,13 +150,20 @@ router.patch('/:id', authenticate, authorizeResource('edit', 'entry'), (req, res
         const updatedDate = entryDate !== undefined ? entryDate : existing.entry_date;
         const updatedTags = Array.isArray(tags) ? tags.join(',') : (tags !== undefined ? tags : existing.tags);
 
-        db.prepare(`
-            UPDATE journal_entries
-            SET title = ?, body = ?, mood = ?, tags = ?, entry_date = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        `).run(updatedTitle, updatedBody, updatedMood, updatedTags, updatedDate, entryId);
+        await db.execute({
+            sql: `
+                UPDATE journal_entries
+                SET title = ?, body = ?, mood = ?, tags = ?, entry_date = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            `,
+            args: [updatedTitle, updatedBody, updatedMood, updatedTags, updatedDate, entryId]
+        });
 
-        const updated = db.prepare(`SELECT * FROM journal_entries WHERE id = ?`).get(entryId);
+        const updatedResult = await db.execute({
+            sql: `SELECT * FROM journal_entries WHERE id = ?`,
+            args: [entryId]
+        });
+        const updated = updatedResult.rows[0];
 
         return res.json({
             message: 'Entry updated successfully.',
@@ -154,10 +179,13 @@ router.patch('/:id', authenticate, authorizeResource('edit', 'entry'), (req, res
 });
 
 // DELETE /entries/:id — Delete entry
-router.delete('/:id', authenticate, authorizeResource('delete', 'entry'), (req, res) => {
+router.delete('/:id', authenticate, authorizeResource('delete', 'entry'), async (req, res) => {
     try {
         const entryId = req.params.id;
-        db.prepare(`UPDATE journal_entries SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`).run(entryId);
+        await db.execute({
+            sql: `UPDATE journal_entries SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            args: [entryId]
+        });
         return res.json({ message: 'Entry deleted.' });
     } catch (err) {
         return res.status(500).json({ error: 'Failed to delete entry.' });

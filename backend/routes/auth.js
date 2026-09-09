@@ -21,8 +21,11 @@ router.post('/register', async (req, res) => {
             return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
         }
 
-        const existingUser = db.prepare(`SELECT id FROM users WHERE email = ?`).get(email.toLowerCase().trim());
-        if (existingUser) {
+        const existingUserResult = await db.execute({
+            sql: `SELECT id FROM users WHERE email = ?`,
+            args: [email.toLowerCase().trim()]
+        });
+        if (existingUserResult.rows.length > 0) {
             return res.status(400).json({ error: 'An account with this email already exists.' });
         }
 
@@ -32,28 +35,47 @@ router.post('/register', async (req, res) => {
 
         // Generate unique promo code for new account
         let userPromoCode = generatePromoCode();
-        while (db.prepare(`SELECT id FROM users WHERE promo_code = ?`).get(userPromoCode)) {
+        while (true) {
+            const checkPromo = await db.execute({
+                sql: `SELECT id FROM users WHERE promo_code = ?`,
+                args: [userPromoCode]
+            });
+            if (checkPromo.rows.length === 0) break;
             userPromoCode = generatePromoCode();
         }
 
-        db.prepare(`
-            INSERT INTO users (id, email, password_hash, display_name, promo_code)
-            VALUES (?, ?, ?, ?, ?)
-        `).run(userId, email.toLowerCase().trim(), passwordHash, name, userPromoCode);
+        await db.execute({
+            sql: `
+                INSERT INTO users (id, email, password_hash, display_name, promo_code)
+                VALUES (?, ?, ?, ?, ?)
+            `,
+            args: [userId, email.toLowerCase().trim(), passwordHash, name, userPromoCode]
+        });
 
         // Process Promo Code linkage if supplied during registration
         if (promoCode && promoCode.trim()) {
             const cleanCode = promoCode.trim().toUpperCase();
-            const inviter = db.prepare(`SELECT id FROM users WHERE promo_code = ?`).get(cleanCode);
+            const inviterResult = await db.execute({
+                sql: `SELECT id FROM users WHERE promo_code = ?`,
+                args: [cleanCode]
+            });
 
-            if (inviter && inviter.id !== userId) {
+            if (inviterResult.rows.length > 0 && inviterResult.rows[0].id !== userId) {
+                const inviterId = inviterResult.rows[0].id;
                 const connId1 = generateUUID();
                 const connId2 = generateUUID();
 
-                db.transaction(() => {
-                    db.prepare(`INSERT OR IGNORE INTO user_connections (id, user_a, user_b) VALUES (?, ?, ?)`).run(connId1, userId, inviter.id);
-                    db.prepare(`INSERT OR IGNORE INTO user_connections (id, user_a, user_b) VALUES (?, ?, ?)`).run(connId2, inviter.id, userId);
-                })();
+                // LibSQL Batch Transaction
+                await db.batch([
+                    {
+                        sql: `INSERT OR IGNORE INTO user_connections (id, user_a, user_b) VALUES (?, ?, ?)`,
+                        args: [connId1, userId, inviterId]
+                    },
+                    {
+                        sql: `INSERT OR IGNORE INTO user_connections (id, user_a, user_b) VALUES (?, ?, ?)`,
+                        args: [connId2, inviterId, userId]
+                    }
+                ], "write");
             }
         }
 
@@ -63,10 +85,13 @@ router.post('/register', async (req, res) => {
         const sessionId = generateUUID();
         const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
-        db.prepare(`
-            INSERT INTO sessions (id, user_id, token_hash, expires_at)
-            VALUES (?, ?, ?, ?)
-        `).run(sessionId, userId, tokenHash, expiresAt);
+        await db.execute({
+            sql: `
+                INSERT INTO sessions (id, user_id, token_hash, expires_at)
+                VALUES (?, ?, ?, ?)
+            `,
+            args: [sessionId, userId, tokenHash, expiresAt]
+        });
 
         res.cookie('session_token', rawToken, {
             httpOnly: true,
@@ -76,10 +101,13 @@ router.post('/register', async (req, res) => {
         });
 
         // Audit log
-        db.prepare(`
-            INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
-            VALUES (?, ?, 'USER_REGISTER', 'user', ?)
-        `).run(generateUUID(), userId, userId);
+        await db.execute({
+            sql: `
+                INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
+                VALUES (?, ?, 'USER_REGISTER', 'user', ?)
+            `,
+            args: [generateUUID(), userId, userId]
+        });
 
         return res.status(201).json({
             message: 'Account created successfully.',
@@ -99,10 +127,14 @@ router.post('/login', async (req, res) => {
             return res.status(400).json({ error: 'Email and password are required.' });
         }
 
-        let user = db.prepare(`SELECT * FROM users WHERE email = ? AND status = 'active'`).get(email.toLowerCase().trim());
-        if (!user) {
+        const userResult = await db.execute({
+            sql: `SELECT * FROM users WHERE email = ? AND status = 'active'`,
+            args: [email.toLowerCase().trim()]
+        });
+        if (userResult.rows.length === 0) {
             return res.status(401).json({ error: 'Invalid email or password.' });
         }
+        let user = userResult.rows[0];
 
         const validPassword = await bcrypt.compare(password, user.password_hash);
         if (!validPassword) {
@@ -111,7 +143,10 @@ router.post('/login', async (req, res) => {
 
         if (!user.promo_code) {
             let code = generatePromoCode();
-            db.prepare(`UPDATE users SET promo_code = ? WHERE id = ?`).run(code, user.id);
+            await db.execute({
+                sql: `UPDATE users SET promo_code = ? WHERE id = ?`,
+                args: [code, user.id]
+            });
             user.promo_code = code;
         }
 
@@ -121,10 +156,13 @@ router.post('/login', async (req, res) => {
         const sessionId = generateUUID();
         const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
-        db.prepare(`
-            INSERT INTO sessions (id, user_id, token_hash, expires_at)
-            VALUES (?, ?, ?, ?)
-        `).run(sessionId, user.id, tokenHash, expiresAt);
+        await db.execute({
+            sql: `
+                INSERT INTO sessions (id, user_id, token_hash, expires_at)
+                VALUES (?, ?, ?, ?)
+            `,
+            args: [sessionId, user.id, tokenHash, expiresAt]
+        });
 
         res.cookie('session_token', rawToken, {
             httpOnly: true,
@@ -173,9 +211,14 @@ router.post('/google', async (req, res) => {
         const name = payload.name || payload.given_name || userEmail.split('@')[0];
 
         // Find or create the user
-        let user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(userEmail);
+        let userResult = await db.execute({
+            sql: `SELECT * FROM users WHERE email = ?`,
+            args: [userEmail]
+        });
+        
+        let user;
 
-        if (!user) {
+        if (userResult.rows.length === 0) {
             if (!isRegistering) {
                 return res.status(401).json({ error: 'No account found for this Google email. Please create an account first.' });
             }
@@ -184,21 +227,32 @@ router.post('/google', async (req, res) => {
             // Use a secure random password hash (not guessable — Google SSO users never need it)
             const passwordHash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 12);
             let userPromoCode = generatePromoCode();
-            while (db.prepare(`SELECT id FROM users WHERE promo_code = ?`).get(userPromoCode)) {
+            while (true) {
+                const checkPromo = await db.execute({ sql: `SELECT id FROM users WHERE promo_code = ?`, args: [userPromoCode] });
+                if (checkPromo.rows.length === 0) break;
                 userPromoCode = generatePromoCode();
             }
 
-            db.prepare(`
-                INSERT INTO users (id, email, password_hash, display_name, promo_code)
-                VALUES (?, ?, ?, ?, ?)
-            `).run(userId, userEmail, passwordHash, name, userPromoCode);
+            await db.execute({
+                sql: `
+                    INSERT INTO users (id, email, password_hash, display_name, promo_code)
+                    VALUES (?, ?, ?, ?, ?)
+                `,
+                args: [userId, userEmail, passwordHash, name, userPromoCode]
+            });
 
-            user = db.prepare(`SELECT * FROM users WHERE id = ?`).get(userId);
+            const newUserResult = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [userId] });
+            user = newUserResult.rows[0];
 
-            db.prepare(`
-                INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
-                VALUES (?, ?, 'GOOGLE_REGISTER', 'user', ?)
-            `).run(generateUUID(), userId, userId);
+            await db.execute({
+                sql: `
+                    INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
+                    VALUES (?, ?, 'GOOGLE_REGISTER', 'user', ?)
+                `,
+                args: [generateUUID(), userId, userId]
+            });
+        } else {
+            user = userResult.rows[0];
         }
 
         const rawToken = crypto.randomBytes(32).toString('hex');
@@ -206,10 +260,13 @@ router.post('/google', async (req, res) => {
         const sessionId = generateUUID();
         const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
-        db.prepare(`
-            INSERT INTO sessions (id, user_id, token_hash, expires_at)
-            VALUES (?, ?, ?, ?)
-        `).run(sessionId, user.id, tokenHash, expiresAt);
+        await db.execute({
+            sql: `
+                INSERT INTO sessions (id, user_id, token_hash, expires_at)
+                VALUES (?, ?, ?, ?)
+            `,
+            args: [sessionId, user.id, tokenHash, expiresAt]
+        });
 
         res.cookie('session_token', rawToken, {
             httpOnly: true,
@@ -229,9 +286,12 @@ router.post('/google', async (req, res) => {
 });
 
 // Logout
-router.post('/logout', authenticate, (req, res) => {
+router.post('/logout', authenticate, async (req, res) => {
     try {
-        db.prepare(`UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?`).run(req.sessionId);
+        await db.execute({
+            sql: `UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            args: [req.sessionId]
+        });
         res.clearCookie('session_token');
         return res.json({ message: 'Logged out successfully.' });
     } catch (err) {
@@ -240,16 +300,24 @@ router.post('/logout', authenticate, (req, res) => {
 });
 
 // Current Session Info
-router.get('/session', authenticate, (req, res) => {
-    const user = db.prepare(`SELECT id, email, display_name, promo_code FROM users WHERE id = ?`).get(req.user.id);
-    return res.json({
-        user: {
-            id: user.id,
-            email: user.email,
-            displayName: user.display_name,
-            promoCode: user.promo_code
-        }
-    });
+router.get('/session', authenticate, async (req, res) => {
+    try {
+        const userResult = await db.execute({
+            sql: `SELECT id, email, display_name, promo_code FROM users WHERE id = ?`,
+            args: [req.user.id]
+        });
+        const user = userResult.rows[0];
+        return res.json({
+            user: {
+                id: user.id,
+                email: user.email,
+                displayName: user.display_name,
+                promoCode: user.promo_code
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to retrieve session info.' });
+    }
 });
 
 module.exports = router;

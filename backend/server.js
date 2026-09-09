@@ -11,6 +11,7 @@ const entriesRoutes = require('./routes/entries');
 const audioRoutes = require('./routes/audio');
 const transcriptRoutes = require('./routes/transcripts');
 const accessRoutes = require('./routes/access');
+const { initDB } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -67,8 +68,13 @@ app.get('*', (req, res) => {
 
 // Start Server
 if (require.main === module) {
-    app.listen(PORT, () => {
-        console.log(`[Dear Diary Backend] Listening on http://localhost:${PORT}`);
+    initDB().then(() => {
+        app.listen(PORT, () => {
+            console.log(`[Dear Diary Backend] Listening on http://localhost:${PORT}`);
+        });
+    }).catch(err => {
+        console.error("Failed to initialize database:", err);
+        process.exit(1);
     });
 }
 

@@ -7,7 +7,7 @@ const { authorizeResource } = require('../middleware/authorize');
 const router = express.Router();
 
 // POST /access/invitations — Create invitation link/token
-router.post('/access/invitations', authenticate, (req, res) => {
+router.post('/access/invitations', authenticate, async (req, res) => {
     try {
         const inviterId = req.user.id;
         const { inviteeEmail } = req.body;
@@ -17,10 +17,13 @@ router.post('/access/invitations', authenticate, (req, res) => {
         const invitationId = generateUUID();
         const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(); // 48 hrs
 
-        db.prepare(`
-            INSERT INTO invitations (id, inviter_user_id, invitee_identifier, token_hash, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-        `).run(invitationId, inviterId, inviteeEmail ? inviteeEmail.trim().toLowerCase() : null, tokenHash, expiresAt);
+        await db.execute({
+            sql: `
+                INSERT INTO invitations (id, inviter_user_id, invitee_identifier, token_hash, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+            `,
+            args: [invitationId, inviterId, inviteeEmail ? inviteeEmail.trim().toLowerCase() : null, tokenHash, expiresAt]
+        });
 
         return res.status(201).json({
             message: 'Invitation generated successfully.',
@@ -37,7 +40,7 @@ router.post('/access/invitations', authenticate, (req, res) => {
 });
 
 // POST /access/invitations/accept — Accept invitation
-router.post('/access/invitations/accept', authenticate, (req, res) => {
+router.post('/access/invitations/accept', authenticate, async (req, res) => {
     try {
         const { token } = req.body;
         const recipientId = req.user.id;
@@ -48,32 +51,41 @@ router.post('/access/invitations/accept', authenticate, (req, res) => {
 
         const tokenHash = hashToken(token);
 
-        const invitation = db.prepare(`
-            SELECT * FROM invitations 
-            WHERE token_hash = ?
-              AND accepted_at IS NULL
-              AND revoked_at IS NULL
-              AND datetime(expires_at) > datetime('now')
-        `).get(tokenHash);
+        const invitationResult = await db.execute({
+            sql: `
+                SELECT * FROM invitations 
+                WHERE token_hash = ?
+                  AND accepted_at IS NULL
+                  AND revoked_at IS NULL
+                  AND datetime(expires_at) > datetime('now')
+            `,
+            args: [tokenHash]
+        });
 
-        if (!invitation) {
+        if (invitationResult.rows.length === 0) {
             return res.status(400).json({ error: 'Invalid or expired invitation token.' });
         }
+        
+        const invitation = invitationResult.rows[0];
 
         if (invitation.inviter_user_id === recipientId) {
             return res.status(400).json({ error: 'You cannot accept your own invitation.' });
         }
 
-        // Mark accepted inside transaction
-        db.transaction(() => {
-            db.prepare(`UPDATE invitations SET accepted_at = CURRENT_TIMESTAMP WHERE id = ?`).run(invitation.id);
-
-            // Audit log
-            db.prepare(`
-                INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
-                VALUES (?, ?, 'INVITATION_ACCEPTED', 'invitation', ?)
-            `).run(generateUUID(), recipientId, invitation.id);
-        })();
+        // Mark accepted inside transaction (LibSQL Batch)
+        await db.batch([
+            {
+                sql: `UPDATE invitations SET accepted_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                args: [invitation.id]
+            },
+            {
+                sql: `
+                    INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
+                    VALUES (?, ?, 'INVITATION_ACCEPTED', 'invitation', ?)
+                `,
+                args: [generateUUID(), recipientId, invitation.id]
+            }
+        ], "write");
 
         return res.json({ message: 'Invitation accepted successfully.' });
     } catch (err) {
@@ -83,50 +95,67 @@ router.post('/access/invitations/accept', authenticate, (req, res) => {
 });
 
 // POST /entries/:id/access — Grant recipient access to specific entry (Owner only)
-router.post('/entries/:id/access', authenticate, authorizeResource('edit', 'entry'), (req, res) => {
+router.post('/entries/:id/access', authenticate, authorizeResource('edit', 'entry'), async (req, res) => {
     try {
         const ownerId = req.user.id;
         const entryId = req.params.id;
         const { recipientEmail, recipientUserId } = req.body;
 
-        let recipient = null;
+        let recipientResult = null;
 
         if (recipientUserId) {
-            recipient = db.prepare(`SELECT id, email, display_name FROM users WHERE id = ?`).get(recipientUserId);
+            recipientResult = await db.execute({
+                sql: `SELECT id, email, display_name FROM users WHERE id = ?`,
+                args: [recipientUserId]
+            });
         } else if (recipientEmail) {
-            recipient = db.prepare(`SELECT id, email, display_name FROM users WHERE email = ?`).get(recipientEmail.trim().toLowerCase());
+            recipientResult = await db.execute({
+                sql: `SELECT id, email, display_name FROM users WHERE email = ?`,
+                args: [recipientEmail.trim().toLowerCase()]
+            });
         }
 
-        if (!recipient) {
+        if (!recipientResult || recipientResult.rows.length === 0) {
             return res.status(404).json({ error: 'User account not found.' });
         }
+        
+        const recipient = recipientResult.rows[0];
 
         if (recipient.id === ownerId) {
             return res.status(400).json({ error: 'Owner already has full access.' });
         }
 
         // Check if active grant already exists
-        const existingGrant = db.prepare(`
-            SELECT id FROM access_grants 
-            WHERE resource_id = ? AND recipient_user_id = ? AND revoked_at IS NULL
-        `).get(entryId, recipient.id);
+        const existingGrantResult = await db.execute({
+            sql: `
+                SELECT id FROM access_grants 
+                WHERE resource_id = ? AND recipient_user_id = ? AND revoked_at IS NULL
+            `,
+            args: [entryId, recipient.id]
+        });
 
-        if (existingGrant) {
-            return res.json({ message: 'Access is already granted to this account.', grantId: existingGrant.id });
+        if (existingGrantResult.rows.length > 0) {
+            return res.json({ message: 'Access is already granted to this account.', grantId: existingGrantResult.rows[0].id });
         }
 
         const grantId = generateUUID();
 
-        db.prepare(`
-            INSERT INTO access_grants (id, owner_user_id, recipient_user_id, resource_type, resource_id, permission)
-            VALUES (?, ?, ?, 'journal_entry', ?, 'read')
-        `).run(grantId, ownerId, recipient.id, entryId);
+        await db.execute({
+            sql: `
+                INSERT INTO access_grants (id, owner_user_id, recipient_user_id, resource_type, resource_id, permission)
+                VALUES (?, ?, ?, 'journal_entry', ?, 'read')
+            `,
+            args: [grantId, ownerId, recipient.id, entryId]
+        });
 
         // Audit log
-        db.prepare(`
-            INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
-            VALUES (?, ?, 'ACCESS_GRANTED', 'journal_entry', ?)
-        `).run(generateUUID(), ownerId, entryId);
+        await db.execute({
+            sql: `
+                INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
+                VALUES (?, ?, 'ACCESS_GRANTED', 'journal_entry', ?)
+            `,
+            args: [generateUUID(), ownerId, entryId]
+        });
 
         return res.status(201).json({
             message: 'Access granted successfully.',
@@ -143,22 +172,28 @@ router.post('/entries/:id/access', authenticate, authorizeResource('edit', 'entr
 });
 
 // DELETE /entries/:id/access/:grantId — Revoke access grant immediately (Owner only)
-router.delete('/entries/:id/access/:grantId', authenticate, authorizeResource('edit', 'entry'), (req, res) => {
+router.delete('/entries/:id/access/:grantId', authenticate, authorizeResource('edit', 'entry'), async (req, res) => {
     try {
         const { grantId } = req.params;
         const ownerId = req.user.id;
 
-        db.prepare(`
-            UPDATE access_grants 
-            SET revoked_at = CURRENT_TIMESTAMP 
-            WHERE id = ? AND owner_user_id = ?
-        `).run(grantId, ownerId);
+        await db.execute({
+            sql: `
+                UPDATE access_grants 
+                SET revoked_at = CURRENT_TIMESTAMP 
+                WHERE id = ? AND owner_user_id = ?
+            `,
+            args: [grantId, ownerId]
+        });
 
         // Audit log
-        db.prepare(`
-            INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
-            VALUES (?, ?, 'ACCESS_REVOKED', 'access_grant', ?)
-        `).run(generateUUID(), ownerId, grantId);
+        await db.execute({
+            sql: `
+                INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id)
+                VALUES (?, ?, 'ACCESS_REVOKED', 'access_grant', ?)
+            `,
+            args: [generateUUID(), ownerId, grantId]
+        });
 
         return res.json({ message: 'Access revoked immediately.' });
     } catch (err) {
@@ -168,27 +203,33 @@ router.delete('/entries/:id/access/:grantId', authenticate, authorizeResource('e
 });
 
 // GET /access/grants — List active grants given or received
-router.get('/access/grants', authenticate, (req, res) => {
+router.get('/access/grants', authenticate, async (req, res) => {
     try {
         const userId = req.user.id;
 
-        const givenGrants = db.prepare(`
-            SELECT g.id, g.resource_id, g.created_at, u.email as recipient_email, u.display_name as recipient_name, e.title as entry_title
-            FROM access_grants g
-            JOIN users u ON g.recipient_user_id = u.id
-            JOIN journal_entries e ON g.resource_id = e.id
-            WHERE g.owner_user_id = ? AND g.revoked_at IS NULL AND e.deleted_at IS NULL
-        `).all(userId);
+        const givenGrantsResult = await db.execute({
+            sql: `
+                SELECT g.id, g.resource_id, g.created_at, u.email as recipient_email, u.display_name as recipient_name, e.title as entry_title
+                FROM access_grants g
+                JOIN users u ON g.recipient_user_id = u.id
+                JOIN journal_entries e ON g.resource_id = e.id
+                WHERE g.owner_user_id = ? AND g.revoked_at IS NULL AND e.deleted_at IS NULL
+            `,
+            args: [userId]
+        });
 
-        const receivedGrants = db.prepare(`
-            SELECT g.id, g.resource_id, g.created_at, u.display_name as owner_name, e.title as entry_title
-            FROM access_grants g
-            JOIN users u ON g.owner_user_id = u.id
-            JOIN journal_entries e ON g.resource_id = e.id
-            WHERE g.recipient_user_id = ? AND g.revoked_at IS NULL AND e.deleted_at IS NULL
-        `).all(userId);
+        const receivedGrantsResult = await db.execute({
+            sql: `
+                SELECT g.id, g.resource_id, g.created_at, u.display_name as owner_name, e.title as entry_title
+                FROM access_grants g
+                JOIN users u ON g.owner_user_id = u.id
+                JOIN journal_entries e ON g.resource_id = e.id
+                WHERE g.recipient_user_id = ? AND g.revoked_at IS NULL AND e.deleted_at IS NULL
+            `,
+            args: [userId]
+        });
 
-        return res.json({ givenGrants, receivedGrants });
+        return res.json({ givenGrants: givenGrantsResult.rows, receivedGrants: receivedGrantsResult.rows });
     } catch (err) {
         return res.status(500).json({ error: 'Failed to fetch access grants.' });
     }
