@@ -1,25 +1,10 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "frontend/package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "dist"
-      }
-    },
-    {
-      "src": "backend/server.js",
-      "use": "@vercel/node"
-    }
-  ],
   "rewrites": [
-    { "source": "/auth/:match*", "destination": "/backend/server.js" },
-    { "source": "/entries/:match*", "destination": "/backend/server.js" },
-    { "source": "/audio/:match*", "destination": "/backend/server.js" },
-    { "source": "/transcripts/:match*", "destination": "/backend/server.js" },
-    { "source": "/access/:match*", "destination": "/backend/server.js" },
-    { "source": "/api/:match*", "destination": "/backend/server.js" },
-    { "source": "/(.*)", "destination": "/frontend/dist/$1" }
+    { "source": "/auth/(.*)", "destination": "/api/index.js" },
+    { "source": "/entries/(.*)", "destination": "/api/index.js" },
+    { "source": "/audio/(.*)", "destination": "/api/index.js" },
+    { "source": "/transcripts/(.*)", "destination": "/api/index.js" },
+    { "source": "/access/(.*)", "destination": "/api/index.js" },
+    { "source": "/api/(.*)", "destination": "/api/index.js" }
   ]
 }
